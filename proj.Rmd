@@ -1,0 +1,725 @@
+---
+title: "Applied Underwriters Business Analyst Take-Home Project"
+author: "Daniel Suryakusuma"
+date: "2/3/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE, message = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(lubridate)
+library(kableExtra)
+
+library(foreign) # for reading in .dbf
+library(readxl)
+# library(MASS) # "select()" has conflict with tidyr
+
+library(MortalityLaws) # for LifeTable function
+# library(help = "MortalityLaws") # to see quick info about this package
+
+# setwd("~/Box/Actuary/work-apps/AUW/proj") # working offline on my macbook
+
+qkable <- function(x, height="360px") { # custom kable
+  x %>% kable(format = "html") %>% kable_styling(bootstrap_options = c("condensed", "responsive", "striped", "hover", "bordered"), font_size = 11, position = "center") %>% scroll_box(width="100%", height= height, fixed_thead =  list(enabled = TRUE, background = "lightgrey") ) 
+}
+```
+
+Thank you for reading. Please see .pptx for a neater presentation of the code and visualizations. 
+
+## Prompt: 
+
+> Currently, patients with a certain category of back injuries usually take a lifelong prescription of powerful pain medication. This medication is known to decrease life expectancy. Trials of a new surgical procedure have been conducted on some patients. If successful, the surgery immediately rids the patient of the ongoing need for medication. The surgery can only be attempted once. If the surgery is unsuccessful then there are no new adverse effects but the patient must continue on medication as before.
+
+> You have separately been provided with credentials to connect to a VPN and a remote machine. You may use any software on the machine. Sufficient software for this project is available there, as are the source data tables in FoxPro (.dbf) format. The source data tables are in a directory on the desktop of the test machine. Your answers to Part I should be loaded into the provided tables QuestionA and QuestionB on the local SQL Server database Analyst_Project. Any files used (including all of your code) should be stored in the directory on the desktop named Results, along with your answers for Part II. Assume today’s date is January 1, 2018.
+
+> Be prepared to talk about your results in a short 20 minute technical interview. Any experience you have with R, SQL Server, Excel or FoxPro is likely to be an advantage. However, we don’t require you to have prior experience, and this project has been completed successfully by candidates with no prior knowledge of SQL, R or FoxPro. Good Luck!
+
+
+```{r, eval = FALSE}
+# dbf.Patients <- read.dbf(file = "./data/PATIENTS.dbf") # read.dbf doesn't work well here; using 'Export' feature from FoxPro instead
+# dbf.LifeTableFemale <-  read.dbf(file = "/data/LIFETABLEFEMALE.DBF")
+
+```
+
+
+```{r}
+# import data as excel
+mac <- TRUE # working on macbook = TRUE; change to FALSE when working on windows RDP
+
+if (mac == FALSE) {
+  str.path <- "~/data/"
+} else {
+  str.path <- "~/Box/Actuary/work-apps/AUW/proj/data/"
+}
+
+lifeTableMale <- read_xls(path = paste0(str.path, "lifetablemale.xls"), col_names = TRUE)
+  lifeTableMale <- lifeTableMale[-1,] # clean; delete the first row to be consistent between male and female
+
+lifeTableFemale <- read_xls(path = paste0(str.path, "lifetablefemale.xls"), col_names = TRUE)
+medication <- read_xls(path = paste0(str.path, "medication.xls"), col_names = TRUE)
+patients <- read_xls(path = paste0(str.path, "patients.xls"), col_names = TRUE)
+patientsSurgery <- read_xls(path = paste0(str.path, "patientssurgery.xls"), col_names = TRUE)
+
+
+```
+
+
+#### Estimating (Remaining) Life Expectancy Per Patient
+
+> Question A)	(10 points) For each patient, calculate their life expectancy if they do not take the medication from now on. Then calculate what their life expectancy would be if they take the medication for the rest of their life. For each patient, how much higher is the life expectancy without medication?
+
+
+
+
+```{r}
+patients %>% qkable()
+```
+
+First we'll calculate the (floor of) age of each patient.
+
+For simplicity (although we can probably do better), we'll construct a life expectancy table with the following columns: 
+
+- `age`
+- `female_no_med`: female life expectancy, not taking this medication for rest of life
+- `female_med`: female life expectancy, **taking medication** each month for rest of life
+- `male_no_med`: male life expectancy, not taking this medication for rest of life
+- `male_med`: female life expectancy, **taking medication** each month for rest of life
+
+
+We'll follow the definition of 'life expectancy" as given by the [Social Security Administration](https://www.ssa.gov/oact/STATS/table4c6.html) and apply it to our problem 
+
+> "the period life expectancy at a given age is the average remaining number of years expected prior to death for [the exact] person, using the mortality rates from the given table.
+
+```{r, warning = FALSE, message = FALSE}
+td <- as_date("2018-01-01") # given today's date is January 1, 2018
+
+ # fix date of birth and date of medication into date format via lubridate library
+for ( col in c("dob", "dom")) {
+  patients[[col]] <- as_date(pull(patients, col))
+}
+
+# fix date of surgery
+patientsSurgery[["dos"]] <- as_date(pull(patientsSurgery, "dos"))
+
+
+# get age (truncated / rounded down)
+patients <- patients %>% 
+  mutate(age = interval(pull(patients, "dob"), td) %/% years(1))
+
+
+```
+
+Let's check seasonality of the birthday months (and similarly for the distribution of birth year). 
+
+```{r}
+# birth month
+month.abb <- month.abb %>% factor(levels = month.abb)
+tmp <- month.abb[month(patients$dob)] %>% factor(levels = month.abb)
+
+select(patients, id, gender, dob) %>% 
+  mutate(bday.month = tmp ) %>%
+  ggplot(aes(x = bday.month)) + geom_bar(color = 'white', aes(fill = gender)) + ggtitle("Distribution/Seasonality of Birth Month") + facet_grid(gender ~ .)
+
+
+
+
+# birth year
+n.years <- max(year(patients$dob)) - min(year(patients$dob)) + 1 # for bin size; most refined granularity 
+
+select(patients, id, gender, dob) %>% 
+  mutate(bday.year = year(dob)) %>%
+  ggplot(aes(x = bday.year)) + geom_histogram(bins = n.years, color = 'white', aes(fill = gender)) + ggtitle("Distribution of Birth Year") + facet_grid(gender ~ .)
+
+```
+
+
+
+Now we'll calculate the life expectancies. We'll use these life expectancies as a "lookup table" based on *current* age for each patient in `patients`. To construct the tables, we could manually code up a function with `lead` and `lag` to emulate excel functions, but for this time we'll use an existing function via the `MortalityLaws` package in R. 
+
+
+```{r}
+
+require(MortalityLaws)
+
+female <- LifeTable( x = lifeTableFemale$age, qx = lifeTableFemale$prob )
+female.med <- LifeTable( x = lifeTableFemale$age, qx = lifeTableFemale$medprob )
+male <- LifeTable( x = lifeTableMale$age, qx = lifeTableMale$prob )
+male.med <- LifeTable( x = lifeTableMale$age, qx = lifeTableMale$medprob )
+
+LifeExp <- tibble(age = as.integer(female$lt$x), # x : age in LifeTable
+                     female_life_exp = female$lt$ex, # ex : life expectancy
+                     female_life_exp_med = female.med$lt$ex,
+                     male_life_exp = male$lt$ex,
+                     male_life_exp_med = male.med$lt$ex) %>%
+  mutate(female_diff = female_life_exp - female_life_exp_med,
+         male_diff = male_life_exp - male_life_exp_med)
+
+LifeExp %>% qkable()
+
+```
+
+
+
+Now let's match up each patient with his/her corresponding life expectancy.
+
+```{r}
+
+# fractional part of age
+# fracpart <- interval(pull(patients, "dob"), td) / years(1) - 
+#   (interval(pull(patients, "dob"), td) %/% years(1)) 
+
+# we're looking at REMAINING life expectancy from today 1/1/2018, so we don't need to add this fractional part
+
+
+patients <- patients %>% mutate(
+  life_exp =  ifelse(gender == 'Female', 
+                              LifeExp$female_life_exp[age - 1], 
+                              LifeExp$male_life_exp[age - 1]),
+  life_exp_med =  ifelse(gender == 'Female',
+                                 LifeExp$female_life_exp_med[age - 1],
+                                 LifeExp$male_life_exp_med[age - 1]),
+  diff_exp = life_exp - life_exp_med
+  )
+
+```
+
+#### Difference in life expectancy (`diff_exp`):
+
+The remaining life expectancy (`life_exp`), life expectancy for those taking medications for the rest of their lives (`life_exp_med`), and the difference in these two life expectancies (`diff_exp`) for all patients by id are shown in the following table. (And better, visualized in the graph).
+
+```{r}
+patients %>% qkable()
+
+patients %>% ggplot(aes(x = diff_exp)) + geom_histogram(bins = 18, color = 'white', fill = 'lightblue')
+
+patients %>% ggplot(aes(x = age, y = diff_exp)) + geom_jitter(aes(color = gender)) + ylab("Years") + ggtitle("Difference in Life Expectancy (Years)")
+```
+
+
+
+
+## Export results into SQL server database `Analyst_Project`. 
+
+```{r}
+QuestionA <- tibble(Id = patients$id,
+                                 LifeExp = patients$life_exp,
+                                 LifeExpMed = patients$life_exp_med,
+                                 LifeExpDiff = patients$diff_exp)
+
+# write into .csv
+write_csv(x = QuestionA,
+          path = "QuestionA.csv",
+          append = FALSE) # import into SQL server
+
+```
+
+
+## Estimate Future Cost of Medication
+
+> Question B)	(5 points) What is the total expected future cost of the medication for each patient, assuming they take it for the rest of their life? Hint: this is not equivalent to the cost of the medication over the life expectancy.
+
+We'll take a similar approach and work with the expected future medical cost per the Life Table `LifeExp` and use this as a look-up table to get each patient's expected future medical cost due to this prescription. 
+
+First let's do a quick data validation. 
+
+```{r, warning = FALSE}
+# quick data validation
+
+med.by.month <- medication %>% pivot_wider(names_from = year, values_from = cost)
+med.by.month %>% qkable()
+
+
+constants <- c() # vector of years that have the same medication price for each month in that year
+different <- c()
+for (years in names(med.by.month)) {
+  if ( var(med.by.month[[years]]) == 0 ) { # variance of 0 implies all equal valued
+    constants <- c(constants, years)
+  } else {
+    different <- c(different, years)
+  }
+}
+
+if (length(constants) == ncol(med.by.month) - 1) {
+  print(paste("For each year between",head(constants,1), "and", tail(constants,1), "the cost of medication is the same for each month."))
+  
+  # only keep medical costs by year
+  medCostTable <- medication %>% pivot_wider(names_from = month, values_from = cost) %>% mutate(cost = `1`) %>% select(c("year", "cost"))
+} else {
+  print("The years", different, "have a change in medication cost somewhere mid-year!")
+}
+
+medCostTable %>% qkable()
+
+medCostTable %>% ggplot(aes(x = year, y = cost)) + geom_point(color = 'lightblue') + ggtitle("Monthly Prescription Medication Cost") + ylab("$USD")
+
+medCostTable %>% mutate(yeardiff = lead(cost) - cost) %>%  ggplot(aes(x = year, y = yeardiff)) + geom_point(color = 'grey') + ggtitle("Annual Increase in Monthly Prescription Medication Cost") + ylab("$USD")
+
+```
+
+
+For some intuition behind the next functions, consider a patient with current age $a$ and let's follow her medical cost through until she is 120 years old. During the next year $[a, a+1)$, she has a `q(1)` probability of dying mid-year (7/1/2018 and hence incurring half a year's medication cost `6 * medcost(1)`) and a `1 - q(1)` probability of surviving until the next year (incurring the full year's medical cost `12 * medcost(1)`). Then in the next year, conditional upon surviving 2018, the expected total cost follows a similar structure. In total, we have:
+
+$$ \mathbb{E}(X) =  \sum_{x = 1}^{\infty} \left[ \left( \prod_{i=1}^{x-1} (1 - q(i)) \right) \left( 6q(x) C(x) + 12 (1 - q(x)) C(x)  \right)  \right] $$
+
+where $C(x)$ is the vector `medcost(x)` and the assumption that the maximum age is 120 makes this a finite sum that we can program. 
+
+```{r}
+
+
+# function to get expected Medical Cost
+getMedCost <- function(age, qx_med, medCostTable = medCostTable) {
+  # age : patient's current age (float or integer)
+  # qx_med : probability of dying within the next year; assumed to happen at the year's midpoint (7/1/20XX) 
+  # medCostTable : monthly medication prescription cost per year, starting 2018 (current)
+  
+  age <- as.integer(age) 
+  n <- 120 - age # number of years "left" POSSIBLE to live until 120
+  q.vec <- tail(qx_med, n) 
+  cost.vec <- head(medCostTable$cost, n)
+  
+  projCost <- 0 # projected (estimated) cost
+  tmp.p <- 1 # running product factor
+  for (yr in 1:n) {
+    projCost <- projCost + 
+      tmp.p * (6 * q.vec[yr] * cost.vec[yr] + 12 * (1 - q.vec[yr]) * cost.vec[yr]) 
+    tmp.p <- tmp.p * (1 - q.vec[yr]) # update with probability of surviving for given `yr` number of years
+  }
+  return(projCost)
+}
+
+estimates <- c()
+
+for (i in 1:nrow(patients)) {
+  if ( patients$gender[i] == 'Female' ) {
+    estimates <- c( estimates,   
+                    getMedCost(age = patients$age[i],
+                  qx_med = lifeTableFemale$medprob,
+                  medCostTable = medCostTable) )
+  } else {
+    estimates <- c( estimates,   
+                    getMedCost(age = patients$age[i],
+                  qx_med = lifeTableMale$medprob,
+                  medCostTable = medCostTable) )
+  }
+}
+
+patients <- patients %>% mutate(est_med_cost = estimates)
+
+# write into .csv
+QuestionB <- tibble(Id = patients$id,
+                    ExpCost = patients$est_med_cost)
+write_csv(x = QuestionB,
+          path = "QuestionB.csv",
+          append = FALSE)
+
+patients %>% ggplot(aes(x = age, y = est_med_cost)) + geom_jitter(aes(color = gender)) + ylab("Estimated Cost \n($USD)") + ggtitle("Estimated Future Medication Cost Per Patient")
+
+```
+
+Relationship between difference in life expectancy and estimated medical cost:
+
+```{r}
+
+patients %>% ggplot(aes(x = diff_exp, y = est_med_cost)) + geom_jitter(aes(color = gender)) + ylab("Estimated Medical Cost \n($USD)") + xlab("Difference in Life Expectancy: \n Unmedicated vs Medicated") + ggtitle("Relationship between Difference in Unmedicated/Medicated \n Life Expectancy and Estimated Medical Cost")
+
+
+medcost.lm <- patients %>% lm(formula = est_med_cost ~ diff_exp)
+
+plot(medcost.lm)
+
+medcost.lm$coefficients
+```
+
+
+
+## Surgery
+
+Now let's consider the `patientsSurgery` dataset with surgical trial results for 200 patients out of the `patients` table. 
+
+- `id`: patient's identification number
+- `dos`: date on which the patient received surgery
+- `surgery`: success = 1, failure = 0
+
+We would like to predict (the probability of) successful surgery based on `gender` and `age_at_surgery`. 
+
+```{r}
+
+genders <- c()
+dobs <- c()
+
+for (i in 1:nrow(patientsSurgery)) {
+  curr.idx <- match(patientsSurgery$id[i], patients$id)
+  genders <- c(genders, patients$gender[curr.idx])
+  dobs <- c(dobs, patients$dob[curr.idx])
+}
+dobs <- as_date(dobs) # back to date format
+
+# age at surgery 
+age_at_surgery <- interval(dobs, patientsSurgery$dos) %/% years(1)
+
+
+patientsSurgery <- patientsSurgery %>% mutate(gender = genders,
+                           age_at_surgery = age_at_surgery)
+```
+
+
+
+```{r}
+# patientsSurgery %>% filter(surgery == 1) %>% ggplot(aes(x = age_at_surgery)) +
+#   geom_histogram(bins = (max(age_at_surgery) - min(age_at_surgery) + 1),
+#                  color = 'white',
+#                  aes(fill = gender)) + facet_grid(gender ~ .) + ggtitle("Successful Surgeries")
+# 
+# patientsSurgery %>% filter(surgery == 0) %>% ggplot(aes(x = age_at_surgery)) +
+#   geom_histogram(bins = (max(age_at_surgery) - min(age_at_surgery) + 1),
+#                  color = 'white',
+#                  aes(fill = gender)) + facet_grid(gender ~ .) + ggtitle("Failed Surgeries")
+
+# patientsSurgery  %>% ggplot(aes(x = age_at_surgery)) +
+#   geom_histogram(bins = (max(age_at_surgery) - min(age_at_surgery) + 1),
+#                  color = 'white',
+#                  aes(fill = gender)) + facet_grid(surgery ~ gender) + ggtitle("Age Distribution of Successful \n vs. Failed Surgeries") 
+
+
+# comparing this way is a bit better visually
+patientsSurgery  %>% ggplot(aes(x = age_at_surgery)) +
+  geom_histogram(bins = (max(age_at_surgery) - min(age_at_surgery) + 1),
+                 color = 'white',
+                 aes(fill = gender)) + facet_grid(gender ~ surgery) + ggtitle("Age Distribution of Successful (1) vs. Failed (0) Surgeries") 
+  
+```
+
+There are some data points at the ends; however, with how sparse those are, there is no reason to believe that a classifier like an SVM would perform significantly better than logistic regression as we will do later. 
+
+```{r}
+patientsSurgery  %>% ggplot(aes(x = age_at_surgery)) +
+  geom_density(kernel = "gaussian",
+                 color = 'white',
+                 aes(fill = gender)) + facet_grid(gender ~ surgery) + ggtitle("Smoothened Density of Successful (1) vs. Failed (0) Surgeries") 
+```
+
+Especially among males, there is good reason to believe the relationship between `age_at_surgery` is nonlinear. Notice this violation is relaxed if we remove the 'outliers' of younger males. Then a linear fit actually may not be so bad. 
+
+We also have no reason to choose a combined model of all patients with `gender` as a predictor, so we choose to instead fit two separate models for each gender on the single predictor `age_at_surgery`.
+
+Before answering Question A of part II, let's naively try an OLS linear regression. 
+
+```{r}
+males <- patientsSurgery %>% filter(gender == 'Female')
+females <- patientsSurgery %>% filter(gender == 'Male') 
+
+ols_male_fit <- males %>% lm(formula = surgery ~ age_at_surgery)
+ols_female_fit <- females %>% lm(formula = surgery ~ age_at_surgery)
+
+# summary()
+
+plot(ols_male_fit)
+plot(males$age_at_surgery, ols_male_fit$residuals)
+
+plot(ols_female_fit)
+```
+
+```{r}
+# patientsSurgery %>% filter(gender == 'Female') %>% scatter.smooth(x = age_at_surgery, y = surgery)
+
+plot(x = males$age_at_surgery, y = males$surgery) + lines(x = males$age_at_surgery, predict(ols_male_fit), col = "red") + title("Linear Prediction (males)")
+plot(x = females$age_at_surgery, y = females$surgery) + lines(x = females$age_at_surgery, predict(ols_female_fit), col = "red") + title("Linear Prediction (females)")
+
+```
+
+Generally, OLS linear regression is inappropriate for a classication system (success/failure) of the surgical procedure. Predicting this linear regression could perhaps be interpreted as $f(x) >= 0.5 \implies \text{success}$ and correspondingly $f(x) < 0.5 \implies \text{failure}$, but notice that this simply yields a cut-off `age_at_surgery`.
+
+Linear regression is based on the 'standard statistical model': 
+
+$$ Y = \beta_0 + \sum_{i = 1}^n [ \beta_i x_i +  e_i ] , \ \text{where } \mathbb{E}(e_i) = 0 \text{  and Var}(e_i) = \sigma^2  $$
+
+It turns out this approach could work because our response variable (success/failure) is binary; however, for some ages we have a probability outside of $[0,1]$ (negative or above 1)! This would be difficult to explain. 
+
+```{r}
+cutoff.male <- (0.5 - ols_male_fit$coefficients[1]) / ols_male_fit$coefficients[2]
+cutoff.female <- (0.5 - ols_female_fit$coefficients[1]) / ols_female_fit$coefficients[2]
+
+plot(x = males$age_at_surgery, y = males$surgery) + lines(x = males$age_at_surgery, predict(ols_male_fit), col = "red") + title("Linear Prediction (males) with cutoff (grey)") + abline(v = cutoff.male, col = "grey", lwd = 5, lty = 2)
+
+plot(x = females$age_at_surgery, y = females$surgery) + lines(x = females$age_at_surgery, predict(ols_female_fit), col = "red") + title("Linear Prediction (females) with cutoff (grey)") + abline(v = cutoff.female, col = "grey", lwd = 5, lty = 2)
+```
+
+Understanding the patients who tried the surgery:
+
+```{r}
+patientsSurgery %>% ggplot(aes(x = age_at_surgery)) + geom_histogram(aes(fill = gender), bins = 10, color = "white", position = "stack") + ggtitle('Distribution of Attempted Surgeries')
+
+```
+
+For ages 25~30, there is a much higher proportion of males attempting surgery than females. 
+
+
+```{r}
+patientsSurgery %>% ggplot(aes(x = dos)) + geom_histogram(bins = 10, color = 'white', fill = 'lightblue')
+```
+
+Unlikely, but let's see if there's any seasonality in the outcomes. 
+
+```{r}
+stackToMonth <- function(vec) {
+  # vec : vector of months from 1 ~ 12 in arbitrary order
+  tmp <- c()
+  for (i in 1:12) {
+    tmp <- c(tmp, sum(vec == i))
+  }
+  return(tmp)
+}
+
+# plot seasons
+success.f <- month(females %>% filter(surgery == 1) %>% pull(dos))
+success.m <- month(males %>% filter(surgery == 1) %>% pull(dos))
+failure.f <- month(females %>% filter(surgery == 0) %>% pull(dos))
+failure.m <- month(males %>% filter(surgery == 0) %>% pull(dos))
+
+
+byseason <- tibble(id = 1:12,
+                   month = month.abb,
+                   success.f = stackToMonth(success.f),
+                   failure.f = stackToMonth(failure.f),
+                   success.m = stackToMonth(success.m),
+                   failure.m = stackToMonth(failure.m)) 
+  
+  
+byseason %>% ggplot(aes(x = month, y = log((success.f + success.m) / (failure.f + failure.m)), base = 2)) + geom_point(color = 'red') + ggtitle("Success/Failure ratio for each month") + ylab("Success/Failure")
+
+
+```
+
+Good, just as we expected. Still good to check. 
+
+
+## Part II - Question 2: 
+
+> (10 points) Fit an appropriate model; use Likelihood Ratio Tests for model selection.
+
+We'll fit to logistic regression which is a canonical model for univariate classification problems like these. For train-test splitting, we don't need a validation dataset since we'll be tuning the logistic function via MLE to our training data. 
+
+```{r}
+# train-test split
+set.seed(20202020)
+n <- nrow(patientsSurgery)
+shufflerows <- sample(n)
+patientsSurgery <- patientsSurgery[shufflerows,]
+
+# ps = patientsSurgery
+ps.f <- patientsSurgery %>% filter(gender == 'Female')
+ps.m <- patientsSurgery %>% filter(gender == 'Male')
+
+ps.f.train <- tail(ps.f, floor(0.8 * nrow(ps.f)))
+ps.f.test <- head(ps.f, ceiling(0.2 * nrow(ps.f)))
+
+ps.m.train <- tail(ps.m, floor(0.8 * nrow(ps.m)))
+ps.m.test <- head(ps.m, ceiling(0.2 * nrow(ps.m)))
+
+```
+#### Prediction results for females:
+
+```{r}
+ps.f.fit <- ps.f.train %>% glm(formula = surgery ~ age_at_surgery, 
+                               family = binomial)
+
+ps.f.train.result <- ifelse( predict.glm(ps.f.fit, 
+                          type = "response") >= 0.5,
+                      1,
+                      0)
+
+ps.f.test.result <- ifelse( predict.glm(ps.f.fit, 
+                          newdata = ps.f.test,
+                          type = "response") >= 0.5,
+                      1,
+                      0)
+
+print(paste("Training accuracy for Females with 80-20 Train-test split is", 
+            (sum(ps.f.train.result == ps.f.train$surgery) / nrow(ps.f.train)) %/% 0.0001 * 0.0001 * 100, 
+            "%" ))
+
+print(paste("Test accuracy for Females with 80-20 Train-test split is", 
+            (sum(ps.f.test.result == ps.f.test$surgery) / nrow(ps.f.test)) %/% 0.0001 * 0.0001 * 100, 
+            "%" ))
+
+
+plot(ps.f.fit)
+summary(ps.f.fit)
+```
+
+#### Prediction results for males:
+
+```{r}
+ps.m.fit <- ps.m.train %>% glm(formula = surgery ~ age_at_surgery, family = binomial)
+
+ps.m.train.result <- ifelse( predict.glm(ps.m.fit, 
+                          type = "response") >= 0.5,
+                      1,
+                      0)
+
+ps.m.test.result <- ifelse( predict.glm(ps.m.fit, 
+                          newdata = ps.m.test,
+                          type = "response") >= 0.5,
+                      1,
+                      0)
+
+print(paste("Training accuracy for Males with 80-20 Train-test split is", 
+            (sum(ps.m.train.result == ps.m.train$surgery) / nrow(ps.m.train)) %/% 0.0001 * 0.0001 * 100, 
+            "%" ))
+
+print(paste("Test accuracy for Males with 80-20 Train-test split is", 
+            (sum(ps.m.test.result == ps.m.test$surgery) / nrow(ps.m.test)) %/% 0.0001 * 0.0001 * 100, 
+            "%" ))
+
+plot(ps.f.fit)
+summary(ps.f.fit)
+```
+
+
+#### Logistic regression: Genders Combined
+
+Let's try a combined model on the table `patientsSurgery` with `age_at_surgery` and `gender`.
+
+```{r}
+set.seed(202002)
+combined.train <- patientsSurgery[sample(nrow(patientsSurgery)),] # shuffle again
+combined.test <- head(combined.train, ceiling(nrow(patientsSurgery) * 0.2))
+combined.train <- tail(combined.train, floor(nrow(patientsSurgery) * 0.8))
+
+combined.fit <- combined.train %>% glm(formula = surgery ~ age_at_surgery + gender,
+                                       family = binomial)
+
+combined.train.result <- ifelse( predict.glm(combined.fit, 
+                          type = "response") >= 0.5,
+                      1,
+                      0)
+
+combined.test.result <- ifelse( predict.glm(combined.fit, 
+                          newdata = combined.test,
+                          type = "response") >= 0.5,
+                      1,
+                      0)
+
+print(paste("Training accuracy for COMBINED MODEL with 80-20 Train-test split is", 
+            (sum(combined.train.result == combined.train$surgery) / length(combined.train.result)) %/% 0.0001 * 0.0001 * 100, 
+            "%" ))
+
+
+print(paste("Test accuracy for COMBINED MODEL with 80-20 Train-test split is", 
+            (sum(combined.test.result == combined.test$surgery) / length(combined.test.result)) %/% 0.0001 * 0.0001 * 100, 
+            "%" ))
+
+plot(combined.fit)
+summary(combined.fit)
+
+```
+
+As this was requested in the prompt, let's look at a LRT for our combined model. Compare `combined.fit` that is trained on `age_at_surgery` and `gender` against a new fit `combined.fit2` that is only trained on `age_at_surgery`. 
+
+```{r}
+combined.fit2 <- combined.train %>% glm(formula = surgery ~ age_at_surgery,
+                                        family = binomial)
+
+combined.result2 <- ifelse( predict.glm(combined.fit2, 
+                          newdata = combined.test,
+                          type = "response") >= 0.5,
+                      1,
+                      0)
+
+combined.train.result2 <- ifelse( predict.glm(combined.fit2,
+                          type = "response") >= 0.5,
+                      1,
+                      0)
+
+
+print(paste("Test accuracy for the combined model 2 with 80-20 Train-test split is", 
+            (sum(combined.result2 == combined.test$surgery) / nrow(combined.test)) %/% 0.0001 * 0.0001 * 100, 
+            "%" ))
+
+print(paste("Training accuracy for the combined model 2 with 80-20 Train-test split is", 
+            (sum(combined.train.result2 == combined.train$surgery) / nrow(combined.train)) %/% 0.0001 * 0.0001 * 100, 
+            "%" ))
+
+anova(combined.fit2, combined.fit, test = "LRT") # same as test = "Chisq" (GOF test)
+```
+
+So with a $p$-value of 0.6206, `gender` is not significant in our model, but we had slightly better test accuracy (84.99% vs 82.49%) when using both variables.  However, why not just use two separate models; one for each gender? Remember this gave testing accuracies 
+
+```{r}
+# root mean square error
+RMSE <- mean((combined.test.result - combined.test$surgery)^2) %>% sqrt()
+RMSE # relatively high for the domain of 0 ~ 1, but I'm not sure how much to read into this.
+```
+
+
+
+```{r}
+summary(ps.f.fit) # females
+```
+
+```{r}
+summary(ps.m.fit) # males
+```
+
+Further direction with this investigation: Applying prediction model to each age.
+
+- We can perhaps perform some calculations between the cost-benefit tradeoff of surgery at $\$X$ 
+
+```{r}
+# all.females <- patients %>% filter(gender == 'Female')  %>% select(id, gender, age, diff_exp, est_med_cost)
+# all.males <- patients %>% filter(gender == 'Male') %>% select(id, gender, age, diff_exp, est_med_cost)
+
+# predict.females <- ifelse(predict.glm(object = ps.f.fit, newdata = all.females, type = 'response') >= 0.5, 1, 0)
+# predict.males <- ifelse(predict(object = ps.m.fit, newdata = all.females, type = 'response') >= 0.5, 1, 0)
+
+# all.females <- all.females %>% mutate(predictedSurgery = predict.females)
+# all.males <- all.males %>% mutate(predictedSurgery = predict.males)
+
+# length(ps.f.fit$data$age_at_surgery)
+# length(16:90)
+
+
+agerange <- tibble(x = 16L:90L, age_at_surgery = 16L:90L) # considered for surgery
+
+# predicted probability of success
+predProbs <- tibble(age = agerange$age_at_surgery,
+                    f = predict.glm(object = ps.f.fit, newdata = agerange, type = 'response'),
+                    m = predict.glm(object = ps.m.fit, newdata = agerange, type = 'response'))
+
+predProbs.longer <- predProbs %>% pivot_longer(- age, names_to = "gender", values_to = "prob")
+
+predProbs.longer %>% ggplot(aes(x = age, y = prob)) + geom_point(aes(color = gender)) + ggtitle("Predicted Probability of Successful Surgery")
+
+```
+
+
+Surgical operations such as lumbar fusion surgery for the lower back can cost up to \$150,000. Assuming this cost, we might be interested in when we would 'accept' a currently medicated patient's request for surgery instead of lifelong medication. 
+
+```{r}
+cost_of_surgery <- 80000 # arbitrary number
+
+
+benefit.f <- c()
+benefit.m <- c()
+for (i in 16:90) {
+  benefit.f <- c(benefit.f, getMedCost(i, qx_med = lifeTableFemale$medprob, medCostTable) * predProbs$f[i-15] - cost_of_surgery )
+  benefit.m <- c(benefit.m, getMedCost(i, qx_med = lifeTableMale$medprob, medCostTable) * predProbs$m[i-15] - cost_of_surgery )
+}
+
+
+
+# cost_benefit <- predProbs %>% mutate(benefit.f = getMedCost(age, qx_med = lifeTableFemale$medprob, medCostTable = medCostTable) * f - cost_of_surgery,
+#                                      benefit.m = getMedCost(age, qx_med = lifeTableMale$medprob, medCostTable = medCostTable) * m - cost_of_surgery)
+
+costbenefit <-  predProbs %>% 
+  mutate(f = benefit.f, m = benefit.m) %>% 
+  # select(age, f, m) %>%
+  pivot_longer(- age, names_to = "gender", values_to = "benefit")
+
+costbenefit %>% ggplot(aes(x = age, y = benefit)) + geom_jitter(aes(color = gender)) + geom_vline(xintercept = 46, color = 'lightblue') + geom_vline(xintercept = 50, color = 'lightpink', show.legend = TRUE) + ggtitle("Projected Cost-Benefit Tradeoff of Surgery vs Lifetime Medication Cost")
+```
+
+
+End of document. Thank you for reading. Please see .pptx for a neater presentation of the above code and visualizations. 
